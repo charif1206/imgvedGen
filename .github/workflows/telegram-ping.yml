@@ -8,17 +8,48 @@ on:
 jobs:
   send-telegram-message:
     runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      LEGACY_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      LEGACY_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Log start time
         run: echo "[START] Workflow started at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-      - name: Send Telegram message
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve and validate secrets
+        shell: bash
         run: |
-          python - <<'PY'
+          set -euo pipefail
+
+          RESOLVED_BOT_TOKEN="${BOT_TOKEN:-${LEGACY_BOT_TOKEN:-}}"
+          RESOLVED_CHAT_ID="${CHAT_ID:-${LEGACY_CHAT_ID:-}}"
+
+          if [ -z "${RESOLVED_BOT_TOKEN}" ]; then
+            echo "::error::Missing BOT_TOKEN secret. You can also provide TELEGRAM_BOT_TOKEN as fallback."
+            exit 1
+          fi
+
+          if [ -z "${RESOLVED_CHAT_ID}" ]; then
+            echo "::error::Missing CHAT_ID secret. You can also provide TELEGRAM_CHAT_ID as fallback."
+            exit 1
+          fi
+
+          echo "::add-mask::${RESOLVED_BOT_TOKEN}"
+          echo "::add-mask::${RESOLVED_CHAT_ID}"
+          echo "RESOLVED_BOT_TOKEN=${RESOLVED_BOT_TOKEN}" >> "${GITHUB_ENV}"
+          echo "RESOLVED_CHAT_ID=${RESOLVED_CHAT_ID}" >> "${GITHUB_ENV}"
+          echo "Secrets resolved successfully."
+
+      - name: Send Telegram message
+        run: |
+          python3 - <<'PY'
           import datetime
           import json
           import os
@@ -30,10 +61,14 @@ jobs:
           now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
           print(f"Preparing Telegram message at {now}")
 
-          token = os.getenv("BOT_TOKEN")
-          chat_id = os.getenv("CHAT_ID")
+          token = os.getenv("RESOLVED_BOT_TOKEN")
+          chat_id = os.getenv("RESOLVED_CHAT_ID")
 
-          missing = [name for name, value in (("BOT_TOKEN", token), ("CHAT_ID", chat_id)) if not value]
+          missing = [
+              name
+              for name, value in (("RESOLVED_BOT_TOKEN", token), ("RESOLVED_CHAT_ID", chat_id))
+              if not value
+          ]
           if missing:
               print(f"::error::Missing required secret(s): {', '.join(missing)}")
               sys.exit(1)
@@ -61,6 +96,11 @@ jobs:
               if not data.get("ok", False):
                   description = data.get("description", "No description provided")
                   print(f"::error::Telegram API error: {description}")
+                  lowered = description.lower()
+                  if "chat not found" in lowered:
+                      print("::error::Hint: verify CHAT_ID and make sure the chat started the bot (/start).")
+                  if "unauthorized" in lowered:
+                      print("::error::Hint: BOT_TOKEN is invalid or revoked. Regenerate via BotFather.")
                   sys.exit(1)
 
               print(f"[SUCCESS] Telegram message sent at {now}")
