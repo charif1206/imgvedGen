@@ -2,7 +2,8 @@ name: Telegram Ping
 
 on:
   schedule:
-    - cron: "*/2 * * * *"
+    # GitHub Actions scheduled workflows run at most every 5 minutes.
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -99,6 +100,9 @@ jobs:
                   lowered = description.lower()
                   if "chat not found" in lowered:
                       print("::error::Hint: verify CHAT_ID and make sure the chat started the bot (/start).")
+                  if "bots can't send messages to bots" in lowered:
+                      print("::error::Hint: CHAT_ID points to a bot account. Use a user, group, or channel chat id instead.")
+                      print("::error::Hint: open Telegram with your bot from a human account, send /start, then use that chat id.")
                   if "unauthorized" in lowered:
                       print("::error::Hint: BOT_TOKEN is invalid or revoked. Regenerate via BotFather.")
                   sys.exit(1)
@@ -109,6 +113,22 @@ jobs:
               error_body = error.read().decode("utf-8", errors="replace")
               print(f"::error::Telegram HTTPError {error.code}: {error.reason}")
               print(f"::error::Telegram error body: {error_body}")
+
+              lowered = ""
+              try:
+                  error_data = json.loads(error_body)
+                  lowered = str(error_data.get("description", "")).lower()
+              except Exception:
+                  lowered = error_body.lower()
+
+              if "bots can't send messages to bots" in lowered:
+                  print("::error::Hint: CHAT_ID points to a bot account. Use a user, group, or channel chat id instead.")
+                  print("::error::Hint: open Telegram with your bot from a human account, send /start, then use that chat id.")
+              if "chat not found" in lowered:
+                  print("::error::Hint: verify CHAT_ID and make sure the chat started the bot (/start).")
+              if "unauthorized" in lowered:
+                  print("::error::Hint: BOT_TOKEN is invalid or revoked. Regenerate via BotFather.")
+
               sys.exit(1)
           except urllib.error.URLError as error:
               print(f"::error::Network error while sending Telegram message: {error.reason}")
