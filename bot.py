@@ -1,773 +1,301 @@
-import asyncio
-import json
-import logging
-import os
-import re
+import random
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
 
-import httpx
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-load_dotenv()
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("prompt_tutor_bot")
-
-# Avoid leaking sensitive URLs (for example bot token endpoints) via verbose HTTP client logs.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-IMAGE_CATEGORIES = [
-    "Image prompting basics",
-    "Subject description",
-    "Environment description",
-    "Lighting",
-    "Camera angle",
-    "Lens and shot type",
-    "Mood and atmosphere",
-    "Style transfer",
-    "Realism vs stylization",
-    "Cinematic prompting",
-    "Negative prompting",
-    "Prompt refinement",
-    "Prompt variations",
-    "Story-based prompting",
-    "Character consistency",
-    "Scene consistency",
-    "Common prompting mistakes",
-]
-
-VIDEO_CATEGORIES = [
-    "Video prompting basics",
-    "Subject description",
-    "Environment description",
-    "Lighting",
-    "Camera angle",
-    "Lens and shot type",
-    "Motion description",
-    "Mood and atmosphere",
-    "Style transfer",
-    "Realism vs stylization",
-    "Cinematic prompting",
-    "Negative prompting",
-    "Prompt refinement",
-    "Prompt variations",
-    "Story-based prompting",
-    "Character consistency",
-    "Scene consistency",
-    "Shot sequencing for video",
-    "Common prompting mistakes",
-]
-
-REQUIRED_MARKERS = [
-    "🎯 Lesson:",
-    "📌 Focus:",
-    "🧩 Base Prompt:",
-    "🔍 Breakdown:",
-    "🎛️ How to modify it:",
-    "🧪 Practice:",
-    "🔥 Bonus Challenge:",
-]
-
-SYSTEM_INSTRUCTIONS = """
-You are an AI tutor bot specialized in teaching Image Prompting and Video Prompting through short, structured lessons.
-
-Mission:
-- Help the learner improve step by step from beginner to advanced in image and video prompting.
-- Every response must be a mini-lesson that teaches exactly one concept.
-
-Teaching style:
-- Clear, friendly, encouraging, practical.
-- Keep lessons concise and usable immediately.
-- Do not overwhelm the learner.
-
-Output constraints:
-- Keep each lesson between 120 and 220 words.
-- Always include at least one ready-to-use prompt.
-- Always explain why the prompt works.
-- Always include creative variations.
-- Always include one short exercise and one bonus challenge.
-- Avoid repetition and keep each lesson fresh.
-
-Required output format exactly:
-🎯 Lesson: [short title]
-
-📌 Focus:
-[1-2 sentences explaining the idea]
-
-🧩 Base Prompt:
-"[insert prompt here]"
-
-🔍 Breakdown:
-- [phrase or keyword] -> [why it matters]
-- [phrase or keyword] -> [why it matters]
-- [phrase or keyword] -> [why it matters]
-
-🎛️ How to modify it:
-- To make it more realistic: ...
-- To make it more cinematic: ...
-- To change the style: ...
-- To change the mood: ...
-- To change camera or motion: ...
-
-🧪 Practice:
-[give the user a short task]
-
-🔥 Bonus Challenge:
-[give a harder variation]
-
-Additional rules:
-- Alternate image and video lessons when mode is auto.
-- If learner asks for examples, provide 3 variations: simple, strong, cinematic/creative.
-- If learner asks to improve a prompt, analyze and rewrite with explanation.
-- For image lessons, emphasize subject, composition, lighting, style, detail level, mood, and camera terms when relevant.
-- For video lessons, emphasize subject movement, camera movement, scene progression, pacing, cinematic action, environmental motion, and continuity.
-""".strip()
-
-DATA_SYSTEM_INSTRUCTIONS = """
-You are a practical data assistant.
-
-Mission:
-- Answer user data questions with useful, concrete information.
-- If exact real-time numbers are uncertain, be explicit about uncertainty instead of inventing certainty.
-- Keep the response actionable and easy to read.
-
-Output constraints:
-- Keep each response between 90 and 180 words.
-- Include at least 3 specific data points.
-- Include one short confidence note.
-- Include one next step the user can take.
-
-Required output format exactly:
-📊 Data Brief:
-[1-2 short sentences]
-
-🧾 Key Data:
-- [data point] -> [what it means]
-- [data point] -> [what it means]
-- [data point] -> [what it means]
-
-⚠️ Confidence:
-[state if data is estimated, broad, or likely to change]
-
-✅ Next Step:
-[one practical action]
-""".strip()
-
-DATA_REQUIRED_MARKERS = [
-    "📊 Data Brief:",
-    "🧾 Key Data:",
-    "⚠️ Confidence:",
-    "✅ Next Step:",
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+HISTORY_FILE = Path(__file__).resolve().parent / "data" / "history.jsonl"
+REQUIRED_LESSON_MARKERS = [
+    "🗓️ درس اليوم",
+    "🎯 النوع",
+    "🧩 البرومبت الأساسي",
+    "🔍 كيف تم بناء البرومبت",
+    "🎓 مفهوم سريع",
+    "🔁 3 تنويعات",
+    "🕒 الطابع الزمني",
 ]
 
 
-class ChatStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = asyncio.Lock()
-        self._data: Dict[str, Any] = {"chats": {}}
-        self._load_from_disk()
+@dataclass
+class Config:
+    telegram_bot_token: str
+    telegram_chat_id: str
+    gemini_api_key: str
+    gemini_model: str
 
-    def _default_state(self) -> Dict[str, Any]:
-        return {
-            "active": False,
-            "mode": "auto",
-            "next_modality": "image",
-            "lesson_count": 0,
-            "image_index": 0,
-            "video_index": 0,
-            "level": "beginner",
-        }
 
-    def _load_from_disk(self) -> None:
-        if not self.path.exists():
-            return
+def load_env_file() -> dict:
+    env_path = Path(__file__).resolve().parent / ".env"
+    loaded: dict = {}
 
+    if not env_path.exists():
+        return loaded
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        loaded[key.strip()] = value.strip()
+
+    return loaded
+
+
+def load_config() -> Config:
+    env_file = load_env_file()
+    return Config(
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", env_file.get("TELEGRAM_BOT_TOKEN", "")).strip(),
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", env_file.get("TELEGRAM_CHAT_ID", "")).strip(),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", env_file.get("GEMINI_API_KEY", "")).strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", env_file.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)).strip(),
+    )
+
+
+def get_next_modality(history_path: Path) -> str:
+    if not history_path.exists():
+        return "image"
+
+    lines = history_path.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
         try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
-            if "chats" not in self._data:
-                self._data = {"chats": {}}
-        except Exception as exc:
-            logger.warning("Could not load chat state file: %s", exc)
-            self._data = {"chats": {}}
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-    def _save_unlocked(self) -> None:
-        self.path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if entry.get("type") != "daily_arabic_lesson":
+            continue
 
-    def _ensure_unlocked(self, chat_id: int) -> Dict[str, Any]:
-        key = str(chat_id)
-        if key not in self._data["chats"]:
-            self._data["chats"][key] = self._default_state()
-        return self._data["chats"][key]
+        last_modality = entry.get("modality")
+        if last_modality == "image":
+            return "video"
+        if last_modality == "video":
+            return "image"
 
-    async def get(self, chat_id: int) -> Dict[str, Any]:
-        async with self._lock:
-            state = self._ensure_unlocked(chat_id)
-            return json.loads(json.dumps(state))
-
-    async def update(self, chat_id: int, updater) -> Dict[str, Any]:
-        async with self._lock:
-            state = self._ensure_unlocked(chat_id)
-            updater(state)
-            self._save_unlocked()
-            return json.loads(json.dumps(state))
-
-    async def active_chat_ids(self) -> List[int]:
-        async with self._lock:
-            chat_ids: List[int] = []
-            for key, state in self._data["chats"].items():
-                if state.get("active"):
-                    chat_ids.append(int(key))
-            return chat_ids
+    return "image"
 
 
-class GeminiLessonEngine:
-    def __init__(self, api_key: str, model: str) -> None:
-        self.api_key = api_key
-        self.model = model
-        self.endpoint = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        )
+def append_history_entry(
+    history_path: Path,
+    lesson_text: str,
+    chat_id: str,
+    model: str,
+    modality: str,
+) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "type": "daily_arabic_lesson",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "chat_id": chat_id,
+        "model": model,
+        "modality": modality,
+        "lesson": lesson_text,
+    }
 
-    async def generate_lesson(
-        self,
-        modality: str,
-        category: str,
-        level: str,
-        lesson_number: int,
-        user_request: Optional[str] = None,
-    ) -> str:
-        feedback = ""
-        for attempt in range(3):
-            user_prompt = self._build_user_prompt(
-                modality=modality,
-                category=category,
-                level=level,
-                lesson_number=lesson_number,
-                user_request=user_request,
-                feedback=feedback,
-            )
+    with history_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            text = await self._call_gemini(user_prompt)
-            if self._is_valid_lesson(text):
-                return text
 
-            wc = self._word_count(text)
-            feedback = (
-                "Your previous output was invalid. "
-                f"Word count was {wc}. Include all required sections exactly once and keep 120-220 words."
-            )
+def is_valid_arabic_lesson(text: str, modality: str) -> bool:
+    if not text.strip():
+        return False
 
-        return self._fallback_lesson(modality, category)
+    for marker in REQUIRED_LESSON_MARKERS:
+        if marker not in text:
+            return False
 
-    async def generate_data_message(self, query: str) -> str:
-        feedback = ""
-        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    required_type = "صورة" if modality == "image" else "فيديو"
+    if f"🎯 النوع: {required_type}" not in text:
+        return False
 
-        for attempt in range(3):
-            user_prompt = self._build_data_prompt(
-                query=query,
-                generated_at=generated_at,
-                feedback=feedback,
-            )
+    variation_count = len(re.findall(r"(?m)^\s*[1-3]\.\s", text))
+    return variation_count >= 3
 
-            text = await self._call_gemini(
-                user_prompt,
-                system_instructions=DATA_SYSTEM_INSTRUCTIONS,
-            )
-            if self._is_valid_data_message(text):
-                return text
 
-            wc = self._word_count(text)
-            feedback = (
-                "Your previous output was invalid. "
-                f"Word count was {wc}. Include all required sections exactly once and keep 90-180 words."
-            )
+def generate_daily_arabic_lesson(
+    api_key: str,
+    model: str,
+    modality: str,
+    retries: int = 3,
+) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    nonce = f"{int(time.time())}-{random.randint(1000, 9999)}"
+    modality_ar = "صورة" if modality == "image" else "فيديو"
 
-        return self._fallback_data_message(query, generated_at)
+    modality_rules = (
+        "اكتب برومبت صورة ثابتة بدون أوامر حركة للكاميرا."
+        if modality == "image"
+        else "اكتب برومبت فيديو يتضمن حركة موضوع واضحة وحركة كاميرا مناسبة."
+    )
+    feedback = ""
 
-    def _build_user_prompt(
-        self,
-        modality: str,
-        category: str,
-        level: str,
-        lesson_number: int,
-        user_request: Optional[str],
-        feedback: str,
-    ) -> str:
-        lines = [
-            f"Generate lesson #{lesson_number}.",
-            f"Target learner level: {level}.",
-            f"Lesson modality: {modality}.",
-            f"Current teaching category: {category}.",
-            "Keep difficulty progressive and practical.",
-            "Use simple language if the user appears beginner.",
-            "Do not include extra sections outside the required format.",
-            "The full response must be 120-220 words.",
-        ]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-        if user_request:
-            lines.append(f"Learner request: {user_request}")
-
-        if feedback:
-            lines.append(feedback)
-
-        return "\n".join(lines)
-
-    def _build_data_prompt(self, query: str, generated_at: str, feedback: str) -> str:
-        lines = [
-            f"User data request: {query}",
-            f"Current UTC time for context: {generated_at}",
-            "Provide practical data-focused information without filler.",
-            "If precision is uncertain, clearly say so in the confidence section.",
-            "The full response must be 90-180 words.",
-        ]
-
-        if feedback:
-            lines.append(feedback)
-
-        return "\n".join(lines)
-
-    async def _call_gemini(
-        self,
-        user_prompt: str,
-        system_instructions: str = SYSTEM_INSTRUCTIONS,
-    ) -> str:
+    for attempt in range(1, retries + 1):
         payload = {
-            "system_instruction": {
-                "parts": [
-                    {
-                        "text": system_instructions,
-                    }
-                ]
-            },
             "contents": [
                 {
                     "parts": [
                         {
-                            "text": user_prompt,
+                            "text": (
+                                "أنشئ درس prompting يومي باللغة العربية لمرسل Telegram. "
+                                f"نوع الدرس المطلوب الآن: {modality_ar}. "
+                                "يجب أن تكون الرسالة تعليمية وعملية ومناسبة للمبتدئين. "
+                                "الرسالة يجب أن تتضمن: "
+                                "1) برومبت عالي الجودة. "
+                                "2) شرح كيف تم بناء البرومبت (الأسلوب، العناصر، البنية). "
+                                "3) شرح مبسط لمفهوم prompting. "
+                                "4) ثلاث تنويعات لنفس البرومبت عبر تغيير عناصر مفتاحية. "
+                                f"{modality_rules} "
+                                "اكتب الرسالة بهذا القالب وبنفس العناوين: "
+                                "🗓️ درس اليوم\n"
+                                f"🎯 النوع: {modality_ar}\n"
+                                "🧩 البرومبت الأساسي\n"
+                                "🔍 كيف تم بناء البرومبت\n"
+                                "🎓 مفهوم سريع\n"
+                                "🔁 3 تنويعات\n"
+                                "اجعل الطول بين 180 و 320 كلمة. "
+                                "يجب أن تبدأ التنويعات بالأرقام 1. 2. 3. "
+                                "أضف سطرًا أخيرًا بعنوان 🕒 الطابع الزمني يحتوي الوقت التالي مرة واحدة فقط. "
+                                f"الوقت: {now}. "
+                                f"Nonce: {nonce}. "
+                                f"{feedback}"
+                            )
                         }
                     ]
                 }
             ],
             "generationConfig": {
-                "temperature": 0.8,
+                "temperature": 1.0,
                 "topP": 0.95,
             },
         }
 
-        timeout = httpx.Timeout(40.0)
-        headers = {
-            "x-goog-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
+        body = json.dumps(payload).encode("utf-8")
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            data: Dict[str, Any] = {}
-            for attempt in range(1, 4):
-                try:
-                    response = await client.post(self.endpoint, headers=headers, json=payload)
-
-                    if response.status_code == 429 and attempt < 3:
-                        await asyncio.sleep(attempt * 2)
-                        continue
-
-                    response.raise_for_status()
-                    data = response.json()
-                    break
-                except httpx.HTTPStatusError as exc:
-                    status_code = exc.response.status_code if exc.response else None
-                    if status_code == 429 and attempt < 3:
-                        await asyncio.sleep(attempt * 2)
-                        continue
-                    raise RuntimeError(
-                        f"Gemini API request failed with status {status_code}"
-                    ) from exc
-                except httpx.RequestError as exc:
-                    if attempt < 3:
-                        await asyncio.sleep(attempt * 2)
-                        continue
-                    raise RuntimeError("Network error while calling Gemini API") from exc
-
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise RuntimeError("Gemini returned no candidates")
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text_parts = [part.get("text", "") for part in parts if part.get("text")]
-        text = "\n".join(text_parts).strip()
-        if not text:
-            raise RuntimeError("Gemini returned an empty response")
-
-        return text
-
-    def _word_count(self, text: str) -> int:
-        return len(re.findall(r"\b\w+\b", text))
-
-    def _is_valid_lesson(self, text: str) -> bool:
-        if not text:
-            return False
-
-        for marker in REQUIRED_MARKERS:
-            if marker not in text:
-                return False
-
-        wc = self._word_count(text)
-        return 120 <= wc <= 220
-
-    def _is_valid_data_message(self, text: str) -> bool:
-        if not text:
-            return False
-
-        for marker in DATA_REQUIRED_MARKERS:
-            if marker not in text:
-                return False
-
-        wc = self._word_count(text)
-        return 90 <= wc <= 180
-
-    def _fallback_lesson(self, modality: str, category: str) -> str:
-        motion_line = "camera motion"
-        if modality == "image":
-            motion_line = "camera angle"
-
-        return (
-            f"🎯 Lesson: Precision Through {category}\n\n"
-            "📌 Focus:\n"
-            "Today you will learn to add one high-impact detail that makes prompts clearer and easier for a model to execute. "
-            "A strong prompt names the subject, the setting, and one technical cue.\n\n"
-            "🧩 Base Prompt:\n"
-            f'"A lone traveler crossing a windy desert at sunset, wide composition, dramatic side lighting, realistic detail, calm but tense mood, {motion_line} kept steady."\n\n'
-            "🔍 Breakdown:\n"
-            "- lone traveler -> gives the model a clear subject\n"
-            "- windy desert at sunset -> anchors environment and time\n"
-            "- dramatic side lighting -> shapes mood and visual depth\n\n"
-            "🎛️ How to modify it:\n"
-            "- To make it more realistic: add natural textures like dust, skin detail, and cloth folds.\n"
-            "- To make it more cinematic: increase contrast and include a stronger horizon line.\n"
-            "- To change the style: switch to watercolor, anime ink, or documentary realism.\n"
-            "- To change the mood: use hopeful dawn colors or harsh storm tones.\n"
-            "- To change camera or motion: use close-up framing or a slow tracking movement.\n\n"
-            "🧪 Practice:\n"
-            "Rewrite the base prompt with a different subject but keep the same lighting strategy.\n\n"
-            "🔥 Bonus Challenge:\n"
-            "Create two versions of the same scene, one realistic and one stylized, while keeping composition consistent."
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            },
         )
 
-    def _fallback_data_message(self, query: str, generated_at: str) -> str:
-        return (
-            "📊 Data Brief:\n"
-            f"I could not validate a fully structured Gemini data response for: {query}. "
-            "Here is a safe, direct summary template you can use right now.\n\n"
-            "🧾 Key Data:\n"
-            f"- Query logged at {generated_at} -> gives you a clear reference timestamp\n"
-            "- Data quality status: unavailable -> signals that values should be rechecked\n"
-            "- Output mode: fallback summary -> ensures you still receive a structured reply\n\n"
-            "⚠️ Confidence:\n"
-            "This is a fallback response, not a verified live data snapshot.\n\n"
-            "✅ Next Step:\n"
-            "Retry with /data and a narrower request, for example: /data Bitcoin price trend in the last 24 hours."
-        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text_parts = [part.get("text", "") for part in parts if part.get("text")]
+            text = "\n".join(text_parts).strip()
+            if not text:
+                raise RuntimeError("Gemini returned empty text")
+
+            if is_valid_arabic_lesson(text, modality):
+                return text
+
+            if attempt < retries:
+                feedback = (
+                    "الإخراج السابق غير مطابق للقالب المطلوب. "
+                    "التزم بالعناوين المطلوبة وبالنوع الصحيح وبثلاث تنويعات مرقمة 1. 2. 3."
+                )
+                time.sleep(attempt)
+                continue
+
+            raise RuntimeError("Gemini returned lesson text with invalid structure")
+        except urllib.error.HTTPError as exc:
+            transient_codes = {429, 500, 502, 503, 504}
+            if exc.code in transient_codes and attempt < retries:
+                time.sleep(attempt * 3)
+                continue
+
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Gemini request failed with status {exc.code}: {error_body}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < retries:
+                time.sleep(attempt * 3)
+                continue
+            raise RuntimeError(f"Network error while calling Gemini: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Gemini returned invalid JSON") from exc
+
+    raise RuntimeError("Gemini request failed after retries")
 
 
-def choose_modality(state: Dict[str, Any]) -> str:
-    mode = state.get("mode", "auto")
-    if mode in ("image", "video"):
-        return mode
-    return state.get("next_modality", "image")
+def send_telegram_message(bot_token: str, chat_id: str, text: str) -> dict:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-
-def choose_category(state: Dict[str, Any], modality: str) -> str:
-    if modality == "image":
-        idx = int(state.get("image_index", 0))
-        return IMAGE_CATEGORIES[idx % len(IMAGE_CATEGORIES)]
-
-    idx = int(state.get("video_index", 0))
-    return VIDEO_CATEGORIES[idx % len(VIDEO_CATEGORIES)]
-
-
-def detect_mode_hint(text: str) -> Optional[str]:
-    lowered = text.lower()
-    if "image only" in lowered or "only image" in lowered or "only images" in lowered:
-        return "image"
-    if "video only" in lowered or "only video" in lowered or "only videos" in lowered:
-        return "video"
-    return None
-
-
-def extract_data_request(text: str) -> Optional[str]:
-    match = re.match(r"^\s*data\s*:\s*(.+)$", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-
-    request = match.group(1).strip()
-    return request or None
-
-
-async def send_next_lesson(
-    app: Application,
-    chat_id: int,
-    user_request: Optional[str] = None,
-) -> None:
-    store: ChatStore = app.bot_data["store"]
-    engine: GeminiLessonEngine = app.bot_data["engine"]
-
-    state = await store.get(chat_id)
-    modality = choose_modality(state)
-    category = choose_category(state, modality)
-    lesson_number = int(state.get("lesson_count", 0)) + 1
-
-    lesson = await engine.generate_lesson(
-        modality=modality,
-        category=category,
-        level=state.get("level", "beginner"),
-        lesson_number=lesson_number,
-        user_request=user_request,
+    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-
-    await app.bot.send_message(chat_id=chat_id, text=lesson)
-
-    def updater(current: Dict[str, Any]) -> None:
-        current["lesson_count"] = int(current.get("lesson_count", 0)) + 1
-        if modality == "image":
-            current["image_index"] = int(current.get("image_index", 0)) + 1
-        else:
-            current["video_index"] = int(current.get("video_index", 0)) + 1
-
-        if current.get("mode", "auto") == "auto":
-            current["next_modality"] = "video" if modality == "image" else "image"
-
-    await store.update(chat_id, updater)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat:
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-
-    await store.update(chat_id, lambda s: s.update({"active": True}))
-    await send_next_lesson(
-        app=context.application,
-        chat_id=chat_id,
-        user_request="First lesson for a beginner. Keep it simple and confidence-building.",
-    )
-
-
-async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat:
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-    await store.update(chat_id, lambda s: s.update({"active": True}))
-
-    request = None
-    if context.args:
-        request = " ".join(context.args)
-
-    await send_next_lesson(app=context.application, chat_id=chat_id, user_request=request)
-
-
-async def data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /data your question")
-        return
-
-    query = " ".join(context.args).strip()
-    engine: GeminiLessonEngine = context.application.bot_data["engine"]
 
     try:
-        data_message = await engine.generate_data_message(query)
-        await update.message.reply_text(data_message)
-    except Exception as exc:
-        logger.exception("Failed to generate data response: %s", exc)
-        await update.message.reply_text(
-            "I couldn't fetch a data response right now. Please try again in a moment."
-        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram request failed with status {exc.code}: {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error while sending Telegram message: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Telegram returned invalid JSON") from exc
 
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
 
-async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /mode auto|image|video")
-        return
-
-    mode = context.args[0].strip().lower()
-    if mode not in {"auto", "image", "video"}:
-        await update.message.reply_text("Mode must be one of: auto, image, video")
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-
-    await store.update(chat_id, lambda s: s.update({"mode": mode, "active": True}))
-    await update.message.reply_text(f"Learning mode set to: {mode}")
-
-
-async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-    await store.update(chat_id, lambda s: s.update({"active": False}))
-    await update.message.reply_text("Scheduled lessons paused.")
-
-
-async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-    await store.update(chat_id, lambda s: s.update({"active": True}))
-    await update.message.reply_text("Scheduled lessons resumed.")
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-
-    chat_id = update.effective_chat.id
-    store: ChatStore = context.application.bot_data["store"]
-    state = await store.get(chat_id)
-
-    status = (
-        f"Active: {state.get('active')}\n"
-        f"Mode: {state.get('mode')}\n"
-        f"Next modality: {state.get('next_modality')}\n"
-        f"Lessons sent: {state.get('lesson_count')}"
-    )
-    await update.message.reply_text(status)
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message or not update.message.text:
-        return
-
-    chat_id = update.effective_chat.id
-    message_text = update.message.text.strip()
-    store: ChatStore = context.application.bot_data["store"]
-
-    data_request = extract_data_request(message_text)
-    if data_request:
-        engine: GeminiLessonEngine = context.application.bot_data["engine"]
-        try:
-            data_message = await engine.generate_data_message(data_request)
-            await update.message.reply_text(data_message)
-        except Exception as exc:
-            logger.exception("Failed to generate data response: %s", exc)
-            await update.message.reply_text(
-                "I couldn't fetch a data response right now. Please try again in a moment."
-            )
-        return
-
-    mode_hint = detect_mode_hint(message_text)
-    if mode_hint:
-        await store.update(chat_id, lambda s: s.update({"mode": mode_hint, "active": True}))
-    else:
-        await store.update(chat_id, lambda s: s.update({"active": True}))
-
-    await send_next_lesson(
-        app=context.application,
-        chat_id=chat_id,
-        user_request=message_text,
-    )
-
-
-async def scheduled_lesson_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    app = context.application
-    store: ChatStore = app.bot_data["store"]
-
-    for chat_id in await store.active_chat_ids():
-        try:
-            await send_next_lesson(
-                app=app,
-                chat_id=chat_id,
-                user_request="Scheduled follow-up lesson. Continue progression and avoid repeating prior concepts.",
-            )
-        except Exception as exc:
-            logger.exception("Failed to send scheduled lesson to %s: %s", chat_id, exc)
-
-
-def build_application() -> Application:
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    interval_seconds = int(os.getenv("LESSON_INTERVAL_SECONDS", "7200"))
-
-    if not telegram_token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment")
-    if not gemini_api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY in environment")
-
-    app = Application.builder().token(telegram_token).build()
-
-    data_path = Path("data") / "chats.json"
-    store = ChatStore(data_path)
-    engine = GeminiLessonEngine(api_key=gemini_api_key, model=gemini_model)
-
-    app.bot_data["store"] = store
-    app.bot_data["engine"] = engine
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("lesson", lesson_command))
-    app.add_handler(CommandHandler("data", data_command))
-    app.add_handler(CommandHandler("mode", mode_command))
-    app.add_handler(CommandHandler("pause", pause_command))
-    app.add_handler(CommandHandler("resume", resume_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    if app.job_queue is None:
-        raise RuntimeError("Job queue is not available. Install telegram bot with job-queue extras.")
-
-    app.job_queue.run_repeating(
-        callback=scheduled_lesson_job,
-        interval=interval_seconds,
-        first=30,
-        name="scheduled_lessons",
-    )
-
-    return app
+    return data
 
 
 def main() -> None:
-    # PTB 21.x expects a default event loop in the main thread.
-    # Python 3.14 may not provide one implicitly.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    config = load_config()
 
-    app = build_application()
-    logger.info("Prompt tutor bot started")
-    app.run_polling(drop_pending_updates=True)
+    if not config.telegram_bot_token:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
+    if not config.telegram_chat_id:
+        raise RuntimeError("Missing TELEGRAM_CHAT_ID in .env")
+    if not config.gemini_api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY in .env")
+
+    modality = get_next_modality(HISTORY_FILE)
+    lesson = generate_daily_arabic_lesson(
+        config.gemini_api_key,
+        config.gemini_model,
+        modality,
+    )
+    append_history_entry(
+        HISTORY_FILE,
+        lesson,
+        config.telegram_chat_id,
+        config.gemini_model,
+        modality,
+    )
+    result = send_telegram_message(config.telegram_bot_token, config.telegram_chat_id, lesson)
+
+    message_id = result.get("result", {}).get("message_id")
+    print("Message sent successfully")
+    print(f"Lesson type: {modality}")
+    print(f"Chat ID: {config.telegram_chat_id}")
+    print(f"Telegram message_id: {message_id}")
+    print(f"Sent text: {lesson}")
 
 
 if __name__ == "__main__":

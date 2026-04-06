@@ -1,53 +1,51 @@
-﻿# Image + Video Prompt Tutor Bot
+﻿# Arabic Prompting Lesson Bot
 
-Telegram bot that teaches prompt writing through short lessons every 2 hours.
-
-## Features
-- Gemini-powered mini-lessons with a fixed teaching format
-- Alternates between image prompting and video prompting in `auto` mode
-- Persists per-chat progress and preferences
-- Sends scheduled lessons every 2 hours
-- Handles direct learning requests from users in chat
-- Supports Gemini data replies via `/data` and `data: ...` messages
+This bot generates a new daily prompting lesson in Arabic on each run and sends it to Telegram.
 
 ## Setup
-1. Create and activate a Python virtual environment.
-2. Install dependencies:
+1. No external dependencies are required.
+2. Optional (creates/updates local environment only):
    ```bash
    pip install -r requirements.txt
    ```
-3. Copy `.env.example` to `.env` and fill values:
+3. Ensure `.env` contains:
    - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
    - `GEMINI_API_KEY`
-4. Run the bot:
-   ```bash
-   python bot.py
-   ```
+   - `GEMINI_MODEL` (optional, default: `gemini-2.5-flash`)
 
-## Commands
-- `/start` - activate tutoring and receive your first lesson
-- `/lesson` - get an immediate lesson
-- `/data <question>` - get a structured data-focused response from Gemini
-- `/mode auto|image|video` - choose alternation or fixed lesson type
-- `/pause` - stop scheduled lessons
-- `/resume` - resume scheduled lessons
-- `/status` - view current learning mode and progress
-
-## Notes
-- The bot stores chat state in `data/chats.json`.
-- Scheduled lessons use `LESSON_INTERVAL_SECONDS` (default 7200 seconds).
-- You can also send `data: your question` in chat to trigger a data response.
-
-## Testing
-Run automated checks with:
-
+## Run Bot Once
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python bot.py
 ```
+Each run will:
+- generate an Arabic lesson from Gemini,
+- include either an image prompt or a video prompt,
+- explain the prompt construction,
+- teach prompting concepts simply,
+- include 3 variations,
+- save the lesson in `data/history.jsonl`,
+- send the lesson to Telegram.
 
-If you use the project virtual environment on Windows:
+## GitHub Actions Schedule (Every 2 Hours)
+Workflow file: `.github/workflows/send-arabic-lesson.yml`
 
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+It runs automatically every 2 hours (UTC) and can also be run manually via `workflow_dispatch`.
+
+Required GitHub repository secrets:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (optional)
+
+## Direct IDE Test (no Gemini)
+```bash
+python -m unittest tests.test_send_direct -v
 ```
-# imgvedGen
+This test sends one direct Telegram message to verify token/chat configuration from IDE.
+
+## Flow Test
+```bash
+python tests/test_history_flow.py
+```
+This verifies that lesson history is written before Telegram send.
