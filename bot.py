@@ -374,13 +374,38 @@ class GeminiLessonEngine:
             },
         }
 
-        params = {"key": self.api_key}
         timeout = httpx.Timeout(40.0)
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(self.endpoint, params=params, json=payload)
-            response.raise_for_status()
-            data = response.json()
+            data: Dict[str, Any] = {}
+            for attempt in range(1, 4):
+                try:
+                    response = await client.post(self.endpoint, headers=headers, json=payload)
+
+                    if response.status_code == 429 and attempt < 3:
+                        await asyncio.sleep(attempt * 2)
+                        continue
+
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except httpx.HTTPStatusError as exc:
+                    status_code = exc.response.status_code if exc.response else None
+                    if status_code == 429 and attempt < 3:
+                        await asyncio.sleep(attempt * 2)
+                        continue
+                    raise RuntimeError(
+                        f"Gemini API request failed with status {status_code}"
+                    ) from exc
+                except httpx.RequestError as exc:
+                    if attempt < 3:
+                        await asyncio.sleep(attempt * 2)
+                        continue
+                    raise RuntimeError("Network error while calling Gemini API") from exc
 
         candidates = data.get("candidates", [])
         if not candidates:
@@ -693,7 +718,7 @@ async def scheduled_lesson_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application() -> Application:
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     interval_seconds = int(os.getenv("LESSON_INTERVAL_SECONDS", "7200"))
 
     if not telegram_token:
