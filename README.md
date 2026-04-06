@@ -37,4 +37,17 @@ Telegram bot that teaches prompt writing through short lessons every 2 hours.
 - The bot stores chat state in `data/chats.json`.
 - Scheduled lessons use `LESSON_INTERVAL_SECONDS` (default 7200 seconds).
 - You can also send `data: your question` in chat to trigger a data response.
+
+## Testing
+Run automated checks with:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+If you use the project virtual environment on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
 # imgvedGen

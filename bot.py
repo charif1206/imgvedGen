@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("prompt_tutor_bot")
 
+# Avoid leaking sensitive URLs (for example bot token endpoints) via verbose HTTP client logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 IMAGE_CATEGORIES = [
     "Image prompting basics",
     "Subject description",
