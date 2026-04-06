@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -132,6 +133,43 @@ Additional rules:
 - For video lessons, emphasize subject movement, camera movement, scene progression, pacing, cinematic action, environmental motion, and continuity.
 """.strip()
 
+DATA_SYSTEM_INSTRUCTIONS = """
+You are a practical data assistant.
+
+Mission:
+- Answer user data questions with useful, concrete information.
+- If exact real-time numbers are uncertain, be explicit about uncertainty instead of inventing certainty.
+- Keep the response actionable and easy to read.
+
+Output constraints:
+- Keep each response between 90 and 180 words.
+- Include at least 3 specific data points.
+- Include one short confidence note.
+- Include one next step the user can take.
+
+Required output format exactly:
+📊 Data Brief:
+[1-2 short sentences]
+
+🧾 Key Data:
+- [data point] -> [what it means]
+- [data point] -> [what it means]
+- [data point] -> [what it means]
+
+⚠️ Confidence:
+[state if data is estimated, broad, or likely to change]
+
+✅ Next Step:
+[one practical action]
+""".strip()
+
+DATA_REQUIRED_MARKERS = [
+    "📊 Data Brief:",
+    "🧾 Key Data:",
+    "⚠️ Confidence:",
+    "✅ Next Step:",
+]
+
 
 class ChatStore:
     def __init__(self, path: Path) -> None:
@@ -236,6 +274,32 @@ class GeminiLessonEngine:
 
         return self._fallback_lesson(modality, category)
 
+    async def generate_data_message(self, query: str) -> str:
+        feedback = ""
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        for attempt in range(3):
+            user_prompt = self._build_data_prompt(
+                query=query,
+                generated_at=generated_at,
+                feedback=feedback,
+            )
+
+            text = await self._call_gemini(
+                user_prompt,
+                system_instructions=DATA_SYSTEM_INSTRUCTIONS,
+            )
+            if self._is_valid_data_message(text):
+                return text
+
+            wc = self._word_count(text)
+            feedback = (
+                "Your previous output was invalid. "
+                f"Word count was {wc}. Include all required sections exactly once and keep 90-180 words."
+            )
+
+        return self._fallback_data_message(query, generated_at)
+
     def _build_user_prompt(
         self,
         modality: str,
@@ -264,12 +328,30 @@ class GeminiLessonEngine:
 
         return "\n".join(lines)
 
-    async def _call_gemini(self, user_prompt: str) -> str:
+    def _build_data_prompt(self, query: str, generated_at: str, feedback: str) -> str:
+        lines = [
+            f"User data request: {query}",
+            f"Current UTC time for context: {generated_at}",
+            "Provide practical data-focused information without filler.",
+            "If precision is uncertain, clearly say so in the confidence section.",
+            "The full response must be 90-180 words.",
+        ]
+
+        if feedback:
+            lines.append(feedback)
+
+        return "\n".join(lines)
+
+    async def _call_gemini(
+        self,
+        user_prompt: str,
+        system_instructions: str = SYSTEM_INSTRUCTIONS,
+    ) -> str:
         payload = {
             "system_instruction": {
                 "parts": [
                     {
-                        "text": SYSTEM_INSTRUCTIONS,
+                        "text": system_instructions,
                     }
                 ]
             },
@@ -322,6 +404,17 @@ class GeminiLessonEngine:
         wc = self._word_count(text)
         return 120 <= wc <= 220
 
+    def _is_valid_data_message(self, text: str) -> bool:
+        if not text:
+            return False
+
+        for marker in DATA_REQUIRED_MARKERS:
+            if marker not in text:
+                return False
+
+        wc = self._word_count(text)
+        return 90 <= wc <= 180
+
     def _fallback_lesson(self, modality: str, category: str) -> str:
         motion_line = "camera motion"
         if modality == "image":
@@ -350,6 +443,21 @@ class GeminiLessonEngine:
             "Create two versions of the same scene, one realistic and one stylized, while keeping composition consistent."
         )
 
+    def _fallback_data_message(self, query: str, generated_at: str) -> str:
+        return (
+            "📊 Data Brief:\n"
+            f"I could not validate a fully structured Gemini data response for: {query}. "
+            "Here is a safe, direct summary template you can use right now.\n\n"
+            "🧾 Key Data:\n"
+            f"- Query logged at {generated_at} -> gives you a clear reference timestamp\n"
+            "- Data quality status: unavailable -> signals that values should be rechecked\n"
+            "- Output mode: fallback summary -> ensures you still receive a structured reply\n\n"
+            "⚠️ Confidence:\n"
+            "This is a fallback response, not a verified live data snapshot.\n\n"
+            "✅ Next Step:\n"
+            "Retry with /data and a narrower request, for example: /data Bitcoin price trend in the last 24 hours."
+        )
+
 
 def choose_modality(state: Dict[str, Any]) -> str:
     mode = state.get("mode", "auto")
@@ -374,6 +482,15 @@ def detect_mode_hint(text: str) -> Optional[str]:
     if "video only" in lowered or "only video" in lowered or "only videos" in lowered:
         return "video"
     return None
+
+
+def extract_data_request(text: str) -> Optional[str]:
+    match = re.match(r"^\s*data\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    request = match.group(1).strip()
+    return request or None
 
 
 async def send_next_lesson(
@@ -442,6 +559,27 @@ async def lesson_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_next_lesson(app=context.application, chat_id=chat_id, user_request=request)
 
 
+async def data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /data your question")
+        return
+
+    query = " ".join(context.args).strip()
+    engine: GeminiLessonEngine = context.application.bot_data["engine"]
+
+    try:
+        data_message = await engine.generate_data_message(query)
+        await update.message.reply_text(data_message)
+    except Exception as exc:
+        logger.exception("Failed to generate data response: %s", exc)
+        await update.message.reply_text(
+            "I couldn't fetch a data response right now. Please try again in a moment."
+        )
+
+
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat or not update.message:
         return
@@ -507,6 +645,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message_text = update.message.text.strip()
     store: ChatStore = context.application.bot_data["store"]
 
+    data_request = extract_data_request(message_text)
+    if data_request:
+        engine: GeminiLessonEngine = context.application.bot_data["engine"]
+        try:
+            data_message = await engine.generate_data_message(data_request)
+            await update.message.reply_text(data_message)
+        except Exception as exc:
+            logger.exception("Failed to generate data response: %s", exc)
+            await update.message.reply_text(
+                "I couldn't fetch a data response right now. Please try again in a moment."
+            )
+        return
+
     mode_hint = detect_mode_hint(message_text)
     if mode_hint:
         await store.update(chat_id, lambda s: s.update({"mode": mode_hint, "active": True}))
@@ -557,6 +708,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("lesson", lesson_command))
+    app.add_handler(CommandHandler("data", data_command))
     app.add_handler(CommandHandler("mode", mode_command))
     app.add_handler(CommandHandler("pause", pause_command))
     app.add_handler(CommandHandler("resume", resume_command))
